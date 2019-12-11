@@ -1,0 +1,420 @@
+---
+title: "ETL notebook"
+author: "Team 11"
+date: "June 2, 2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("/Users/leonardovida/Development/bi-project-2019/Dashboard/global.R")
+```
+
+# ETL
+
+This document show the steps required to extract, tansform and load the data in PostgreSQL.
+
+## Extract
+
+### APIs: World Bank and Eurostat
+
+Before using the API of World Bank (WB) and Eurostat (EUT), we need to install an their API connectors libraries (sources: https://github.com/GIST-ORNL/wbstats, http://ropengov.github.io/eurostat/)
+
+```{r, eval=FALSE}
+install.packages("OECD")
+install.packages("hablar")
+install.packages("wbstats")
+install.packages("reshape")
+install.packages("countrycode")
+# if you prefer the latest development versions uncomment the lines below
+# devtools::install_github("GIST-ORNL/wbstats")
+```
+
+* The WB API will fetch data from: http://www.doingbusiness.org/en/data and many more databases. For more complete information about the API documentation, please refer to: https://datahelpdesk.worldbank.org/knowledgebase/articles/889392-about-the-indicators-api-documentation.
+
+* The OECD API will fetch data from: https://stats.oecd.org/. From more complete information about the API documentation, please refer to https://data.oecd.org/api/ and the main cran page for the R package "OECD" https://cran.r-project.org/web/packages/OECD/vignettes/OECD.html
+
+### World Bank Data from API
+
+```{r}
+library(wbstats)
+library(rvest)
+
+# First update the cache of the API
+str(wb_cachelist, max.level = 1)
+new.cache <- wbcache()
+
+# Search the World Bank database
+search.string <- wbsearch(pattern = "Enforcing",
+                           cache = new.cache)
+
+# Getting credit score
+credit.score.0514 <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'IC.CRED.ACC.CRD.DB0514.DFRN',
+                        mrv = 20, cache = new.cache)
+credit.score.1519 <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'IC.CRED.ACC.CRD.DB1519.DFRN',
+                        mrv = 20, cache = new.cache)
+
+# Starting business score
+starting.business <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'IC.REG.STRT.BUS.DFRN',
+                        mrv = 20, cache = new.cache)
+starting.business.days <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'IC.REG.DURS.MA.DY',
+                        mrv = 20, cache = new.cache)
+
+# Paying taxes score
+paying.taxes.0616 <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'PAY.TAX.DB0616.DFRN',
+                        mrv = 20, cache = new.cache)
+paying.taxes.1719 <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'PAY.TAX.DB1719.DRFN',
+                        mrv = 20, cache = new.cache)
+paying.taxes.hours <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'PAY.TAX.TM',
+                        mrv = 20, cache = new.cache)
+
+# Enforcing contract score
+enforcing.contracts.0415 <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'ENF.CONT.COEN.DB0415.DFRN',
+                        mrv = 20, cache = new.cache)
+enforcing.contracts.16 <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'ENF.CONT.COEN.DB16.DFRN',
+                        mrv = 20, cache = new.cache)
+enforcing.contracts.1719 <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'ENF.CONT.COEN.DB1719.DFRN',
+                        mrv = 20, cache = new.cache)
+enforcing.contracts.days <- wb(country = c("DEU", "SWE", "POL", "ISR"), indicator = 'ENF.CONT.DURS.DY',
+                        mrv = 20, cache = new.cache)
+```
+
+### OECD data from API
+
+```{r}
+library(OECD)
+
+# First download the dataset
+dataset_list <- get_datasets() 
+
+# Example of how we searched the OECD database
+# search_dataset("pm2", data = dataset_list)
+# dataset <- "EXP_PM2_5"
+# 
+# # Select the dataset
+# exp.pm2 <- get_data_structure(dataset)
+# str(exp.pm2, max.level = 1)
+# exp.pm2$VAR_DESC
+
+# Mean exposure to pm 2.5
+exp.pm2 <- get_dataset("EXP_PM2_5",
+                  filter = "DEU+ISR+POL+SWE.TOTAL.TOTAL.PWM_EX", 
+                  pre_formatted = TRUE)
+
+# Pollution adjusted GDP and Energy productivity per TOns of pollution
+gdp.adj <- get_dataset("EAMFP",
+                  filter = "DEU+ISR+POL+SWE.PA_GDP_G", 
+                  pre_formatted = TRUE)
+
+eng.pro <- get_dataset("GREEN_GROWTH",
+                  filter = "DEU+ISR+POL+SWE.NRG_PROD", 
+                  pre_formatted = TRUE)
+
+# Environmentally related tax revenue as % of GDP
+tax.rev <- get_dataset("ENV_ENVPOLICY",
+                  filter = "DEU+ISR+POL+SWE.BASE_GDP.TOT", 
+                  pre_formatted = TRUE)
+```
+
+
+## Transform
+
+### Create datasets
+
+For each CSF we will create a dataset that will be used to better distinguish the data and facilitate entering them into the DB.
+Reading, transforming into tibble with cleaned and relevant columns.
+
+```{r, results='hide'}
+# Import necessary libraries
+library(tidyverse)
+library(lubridate)
+library(reshape2)
+library(hablar)
+```
+
+
+```{r, results='hide'}
+# Eurostat dataset
+eur.dataset <- read_csv("../Data/CSV/eis-data.csv") # the eurostat tables used cannot be retrieved from their API
+eur.dataset <- melt(eur.dataset) %>% 
+  rename(year_id = variable,
+         country_id = country_code,
+         indicator_id = indicators,
+         value_type = indicator_type) %>% filter(value_type != "nrmlzd") %>% 
+  select(-value_type)
+
+eur.dataset <- eur.dataset %>% convert(num(year_id))
+```
+
+
+```{r, results='hide'}
+# World bank dataset using data retrieved previously from API
+
+# Removing double dates that occur when binding the tables
+credit.score.1519 <- credit.score.1519 %>% convert(num(date)) %>% filter(date > 2014)
+paying.taxes.1719 <- paying.taxes.1719 %>% convert(num(date)) %>% filter(date > 2016)
+enforcing.contracts.16  <- enforcing.contracts.16 %>% convert(num(date)) %>% filter(date > 2015)
+enforcing.contracts.1719 <- enforcing.contracts.1719 %>% convert(num(date)) %>% filter(date > 2016)
+
+
+wb.dataset <- rbind(credit.score.0514, credit.score.1519, starting.business, paying.taxes.0616, paying.taxes.1719,
+                    enforcing.contracts.0415, enforcing.contracts.16, enforcing.contracts.1719, paying.taxes.hours,
+                    starting.business.days, enforcing.contracts.days) %>% 
+  rename(year_id = date,
+         country_id = iso2c,
+         indicator_id = indicatorID) %>% 
+  mutate(indicator_id = str_replace(indicator_id, "IC.CRED.ACC.CRD.DB0514.DFRN", "getcre"),
+         indicator_id = str_replace(indicator_id, "IC.CRED.ACC.CRD.DB1519.DFRN", "getcre"),
+         indicator_id = str_replace(indicator_id, "IC.REG.STRT.BUS.DFRN", "strbus"),
+         indicator_id = str_replace(indicator_id, "PAY.TAX.DB0616.DFRN", "paytax"),
+         indicator_id = str_replace(indicator_id, "PAY.TAX.DB1719.DRFN", "paytax"),
+         indicator_id = str_replace(indicator_id, "ENF.CONT.COEN.DB0415.DFRN", "enfcon"),
+         indicator_id = str_replace(indicator_id, "ENF.CONT.COEN.DB16.DFRN", "enfcon"),
+         indicator_id = str_replace(indicator_id, "ENF.CONT.COEN.DB1719.DFRN", "enfcon"),
+         indicator_id = str_replace(indicator_id, "PAY.TAX.TM", "payhou"),
+         indicator_id = str_replace(indicator_id, "ENF.CONT.DURS.DY", "enfday"),
+         indicator_id = str_replace(indicator_id, "IC.REG.DURS.MA.DY", "strday"),
+         csf_id = "easbus") %>% 
+  select(-c(iso3c, indicator, country))
+
+wb.dataset <- wb.dataset %>% convert(num(year_id)) %>% 
+  filter(year_id > 2009)
+```
+
+
+```{r, results='hide'}
+# OECD + IEA datasets using data retrieved previously from API
+exp.pm2 <- exp.pm2 %>% select(-c(MAREG, MIREG, VAR, TIME_FORMAT, UNIT, POWERCODE)) %>% 
+  rename(country_id = COU, year_id = obsTime, value = obsValue) %>%
+  mutate(indicator_id = "exppmt")
+eng.pro <- eng.pro %>% select(-c(VAR, TIME_FORMAT, UNIT, POWERCODE, REFERENCEPERIOD)) %>% 
+  rename(country_id = COU, year_id = obsTime, value = obsValue) %>% 
+  mutate(indicator_id = "prdtps")
+tax.rev <- tax.rev %>% select(-c(VAR, DOM, TIME_FORMAT, UNIT, POWERCODE, OBS_STATUS)) %>% 
+  rename(country_id = COU, year_id = obsTime, value = obsValue) %>% 
+  mutate(indicator_id = "taxrev")
+
+sus.dataset <- rbind(exp.pm2, eng.pro, tax.rev)
+sus.dataset.iea <- read_csv("../Data/CSV/sus-data.csv") # read only the data from IEA
+sus.dataset.iea <- melt(sus.dataset.iea) %>% 
+  rename(year_id = variable, #value only until 2016
+         country_id = Country,
+         indicator_id = Flow,
+         value_type = indicator_type) %>% 
+  mutate(country_id = str_replace(country_id, "PO", "PL")) %>% #Change PO code to PL
+  select(-c(value_type, csf_id))
+
+# Merge the two different sustainability datasets
+sus.dataset <- rbind(sus.dataset, sus.dataset.iea) %>% 
+  mutate(country_id = str_replace(country_id, "DEU", "DE"),
+         country_id = str_replace(country_id, "POL", "PL"),
+         country_id = str_replace(country_id, "SWE", "SE"),
+         country_id = str_replace(country_id, "ISR", "IL"),
+         csf_id = "envsus")
+
+sus.dataset <- sus.dataset %>% convert(num(year_id)) %>% 
+  filter(year_id > 2009)
+```
+
+### Last cleanups before normalization
+
+```{r, results='hide'}
+# Trim length columns
+eur.dataset$indicator_id <- strtrim(eur.dataset$indicator_id, 6)
+wb.dataset$indicator_id <- strtrim(wb.dataset$indicator_id, 6)
+sus.dataset$indicator_id <- strtrim(sus.dataset$indicator_id, 6)
+sus.dataset$value <- round(sus.dataset$value, 2)
+
+# Set eventual NAs to 0
+eur.dataset[is.na(eur.dataset)] <- 0
+wb.dataset[is.na(wb.dataset)] <- 0
+sus.dataset[is.na(sus.dataset)] <- 0
+```
+
+### Normalize data to create scores
+
+```{r}
+library(dplyr)
+
+# Create normalized values and values wrt average value and rank wrt to relative values
+eur.dataset <- eur.dataset %>%
+  group_by(year_id, indicator_id) %>%
+  mutate(value_normalized = (value - min(value))/(max(value)-min(value))) %>% 
+  mutate(value_relative_avg = 100*value_normalized/mean(value_normalized)) %>% 
+  mutate(rank_relative = rank(value, ties.method = "random")) %>% 
+  ungroup() # otherwise remain grouped afterwards
+
+wb.dataset.getcre <- wb.dataset %>%  filter(indicator_id == "getcre") %>% 
+  group_by(year_id, indicator_id) %>%
+  mutate(value_normalized = (value - min(value))/(max(value)-min(value))) %>% 
+  mutate(value_relative_avg = 100*value_normalized/mean(value_normalized)) %>% 
+  mutate(rank_relative = rank(value, ties.method = "random")) %>% 
+  ungroup()
+
+wb.dataset <- wb.dataset %>% filter(indicator_id != "getcre") %>% 
+  group_by(year_id, indicator_id) %>%
+  mutate(value_normalized = (value - min(value))/(max(value)-min(value))) %>% 
+  mutate(value_relative_avg = 100*value_normalized/mean(value_normalized)) %>% 
+  mutate(rank_relative = rank(-value, ties.method = "random")) %>% 
+  ungroup()
+
+# Bind the two wb dataset together again
+wb.dataset <- rbind(wb.dataset, wb.dataset.getcre)
+
+# Create individual rank for pm 2.5 (lowest better)
+sus.dataset.pm2 <- sus.dataset %>% filter(indicator_id == "exppmt") %>% 
+  group_by(year_id, indicator_id) %>%
+  mutate(value_normalized = (value - min(value))/(max(value)-min(value))) %>% 
+  mutate(value_relative_avg = 100*value_normalized/mean(value_normalized)) %>% 
+  mutate(rank_relative = rank(-value, ties.method = "random")) %>% 
+  ungroup()
+
+# Create rank for sustenibility indicator without average pm 2.5
+sus.dataset <- sus.dataset %>% filter(indicator_id != "exppmt") %>% 
+  group_by(year_id, indicator_id) %>%
+  mutate(value_normalized = (value - min(value))/(max(value)-min(value))) %>% 
+  mutate(value_relative_avg = 100*value_normalized/mean(value_normalized)) %>% 
+  mutate(rank_relative = rank(value, ties.method = "random")) %>% 
+  ungroup() 
+
+# Bind the two sustenibility dataset together again
+sus.dataset <- rbind(sus.dataset, sus.dataset.pm2)
+```
+
+
+### Create series for SQL dimension tables
+
+This could be done on the Loading step but also here
+```{r}
+# General table
+dataset.full <- rbind(eur.dataset, wb.dataset)
+dataset.full <- rbind(dataset.full, sus.dataset)
+
+# For year_dimension table
+dim.year <- dataset.full %>% distinct(year_id)
+
+# For countries_dimension table
+country.codes <- dataset.full %>% distinct(country_id)
+country.codes <- data.frame(country.codes[,1])
+country.names <- countrycode::countrycode(country.codes[,1], 'iso2c', 'country.name')
+
+dim.country <- data.frame(
+  country_id = country.codes,
+  country_name = country.names
+)
+
+# For indicators_dimension table
+#dim.indicator <- dataset.full %>% distinct(indicator_id) %>%  rename(indicator_code = indicator_id)
+dim.indicator <- indicators # taken from global.R
+
+# For csf_dimension table
+dim.csf <-  dataset.full %>% distinct(csf_id)
+
+dim.csf <- data.frame(
+  csf_id = dim.csf,
+  csf_name = c("Innovative environment for SMEs",
+               "Ease of doing business",
+               "Environmental sustainability")
+)
+```
+
+### Postgres schema
+
+The fact tables: fact_eur, fact_wb, fact_sus are not currently used. We decided to keep them there as we were confused on the necessity of creating mulitple fact tables (i.e. a fact constellation schema). This is because in one of the tutorial we were told we would need multiple fact tables. In order to have both possibilities available we decided to implement both.
+```{sql connection=pool}
+DROP TABLE IF EXISTS fact_eur, fact_wb, fact_sus, dim_year, dim_country, dim_indicator, dim_csf;
+
+CREATE TABLE IF NOT EXISTS dim_year(
+  year_id                INT PRIMARY KEY NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS dim_country(
+  country_name           TEXT NOT NULL DEFAULT 'unknown',
+  country_id             char(2)  PRIMARY KEY  NOT NULL DEFAULT 'unknown'
+);
+
+CREATE TABLE IF NOT EXISTS dim_indicator(
+  indicator_name         TEXT NOT NULL DEFAULT 'unknown',
+  indicator_id           char(6) PRIMARY KEY  NOT NULL DEFAULT 'unknown'
+);
+
+CREATE TABLE IF NOT EXISTS dim_csf(
+  csf_name              TEXT NOT NULL DEFAULT 'unknown',
+  csf_id                TEXT PRIMARY KEY  NOT NULL DEFAULT 'unknown'
+);
+
+CREATE TABLE IF NOT EXISTS fact_eur(
+  fact_id                SERIAL NOT NULL,
+  value                  DECIMAL NOT NULL DEFAULT 0,
+  rank_relative          SMALLINT NOT NULL DEFAULT 0,
+  value_normalized       DECIMAL NOT NULL DEFAULT 0,
+  value_relative_avg     DECIMAL NOT NULL DEFAULT 0,
+  csf_id                 TEXT REFERENCES dim_csf(csf_id) NOT NULL,
+  year_id                SMALLINT REFERENCES dim_year(year_id) NOT NULL,
+  country_id             char(2) REFERENCES dim_country(country_id) NOT NULL,
+  indicator_id           char(6) REFERENCES dim_indicator(indicator_id) NOT NULL,
+  PRIMARY KEY(fact_id, country_id, indicator_id, csf_id)
+);
+
+CREATE TABLE IF NOT EXISTS fact_wb(
+  fact_id                SERIAL NOT NULL,
+  value                  DECIMAL NOT NULL DEFAULT 0,
+  rank_relative          SMALLINT NOT NULL DEFAULT 0,
+  value_normalized       DECIMAL NOT NULL DEFAULT 0,
+  value_relative_avg     DECIMAL NOT NULL DEFAULT 0,
+  csf_id                 TEXT REFERENCES dim_csf(csf_id) NOT NULL,
+  year_id                SMALLINT REFERENCES dim_year(year_id) NOT NULL,
+  country_id             char(2) REFERENCES dim_country(country_id) NOT NULL,
+  indicator_id           char(6) REFERENCES dim_indicator(indicator_id) NOT NULL,
+  PRIMARY KEY(fact_id, country_id, indicator_id, csf_id)
+);
+
+CREATE TABLE IF NOT EXISTS fact_sus(
+  fact_id                SERIAL NOT NULL,
+  value                  DECIMAL NOT NULL DEFAULT 0,
+  rank_relative          SMALLINT NOT NULL DEFAULT 0,
+  value_normalized       DECIMAL NOT NULL DEFAULT 0,
+  value_relative_avg     DECIMAL NOT NULL DEFAULT 0,
+  csf_id                 TEXT REFERENCES dim_csf(csf_id) NOT NULL,
+  year_id                SMALLINT REFERENCES dim_year(year_id) NOT NULL,
+  country_id             char(2) REFERENCES dim_country(country_id) NOT NULL,
+  indicator_id           char(6) REFERENCES dim_indicator(indicator_id) NOT NULL,
+  PRIMARY KEY(fact_id, country_id, indicator_id, csf_id)
+);
+
+CREATE TABLE IF NOT EXISTS fact_gen(
+  fact_id                SERIAL NOT NULL,
+  value                  DECIMAL NOT NULL DEFAULT 0,
+  rank_relative          SMALLINT NOT NULL DEFAULT 0,
+  value_normalized       DECIMAL NOT NULL DEFAULT 0,
+  value_relative_avg     DECIMAL NOT NULL DEFAULT 0,
+  csf_id                 TEXT REFERENCES dim_csf(csf_id) NOT NULL,
+  year_id                SMALLINT REFERENCES dim_year(year_id) NOT NULL,
+  country_id             char(2) REFERENCES dim_country(country_id) NOT NULL,
+  indicator_id           char(6) REFERENCES dim_indicator(indicator_id) NOT NULL,
+  PRIMARY KEY(fact_id, country_id, indicator_id, csf_id)
+);
+
+```
+
+### Load to PostgreSQL
+
+```{r}
+# Write dimension tables
+dbWriteTable(pool, "dim_csf", dim.csf, append=TRUE, row.names = FALSE)
+dbWriteTable(pool, "dim_year", dim.year, append=TRUE, row.names = FALSE)
+dbWriteTable(pool, "dim_country", dim.country, append=TRUE, row.names = FALSE)
+dbWriteTable(pool, "dim_indicator", dim.indicator, append=TRUE, row.names = FALSE)
+
+# Write fact tables
+# Fact constellation schema - see comment above the creation of SQL tables
+dbWriteTable(pool, "fact_wb", wb.dataset, append=TRUE, row.names = FALSE)
+dbWriteTable(pool, "fact_eur", eur.dataset, append=TRUE, row.names = FALSE)
+dbWriteTable(pool, "fact_sus", sus.dataset, append=TRUE, row.names = FALSE)
+
+# General fact table
+dbWriteTable(pool, "fact_gen", dataset.full, append=TRUE, row.names = FALSE)
+```
+
+
+

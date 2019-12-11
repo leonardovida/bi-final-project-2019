@@ -1,0 +1,10 @@
+name: dashboard
+title:
+username:
+account: bi-project-team-11
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 1003830
+bundleId: 2190709
+url: https://bi-project-team-11.shinyapps.io/dashboard/
+when: 1561975764.35772
